@@ -3,7 +3,7 @@ name: FR News Parser
 on:
   repository_dispatch:
     types: [run-fr-parser]
-  workflow_dispatch: # Для ручного запуска из интерфейса GitHub
+  workflow_dispatch:
 
 jobs:
   build-and-run:
@@ -29,4 +29,11 @@ jobs:
           GMAIL_PASSWORD: ${{ secrets.GMAIL_PASSWORD }}
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
         run: python main.py
-        
+
+      - name: Commit & Push sent articles log
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add sent_articles.json || true
+          git commit -m "Update sent articles log [skip ci]" || exit 0
+          git push
