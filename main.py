@@ -1,8 +1,13 @@
 import json
 import os
+import re
 import smtplib
+import tempfile
+from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from urllib.parse import urljoin
+
 import bs4
 import cloudscraper
 
@@ -42,7 +47,7 @@ def save_sent_articles(sent_set):
 
 
 def get_latest_articles():
-    """Парсит ссылки на статьи прямо с главной страницы."""
+    """Парсит ссылки на статьи с главной страницы."""
     try:
         response = scraper.get(BASE_URL, timeout=20)
         response.raise_for_status()
@@ -51,12 +56,10 @@ def get_latest_articles():
         articles = []
         seen_links = set()
 
-        # Находим все ссылки на статьи на главной странице
         for a_tag in soup.find_all("a", href=True):
             href = a_tag["href"]
             title = a_tag.get_text(strip=True)
 
-            # Проверяем, что ссылка ведет на новостную статью (.html) и имеет заголовок
             if href.endswith(".html") and len(title) > 10:
                 full_url = href if href.startswith("http") else f"{BASE_URL}{href}"
                 if full_url not in seen_links:
@@ -69,8 +72,14 @@ def get_latest_articles():
         return []
 
 
-def parse_article_content(url):
-    """Парсит HTML-контент статьи."""
+def parse_and_process_article(url):
+    """
+    Парсит статью, скачивает картинки во временную папку,
+    подготавливает встроенные вложения и возвращает HTML + список файлов.
+    """
+    temp_files = []
+    images_data = []
+
     try:
         response = scraper.get(url, timeout=20)
         response.raise_for_status()
@@ -79,21 +88,52 @@ def parse_article_content(url):
         article_body = soup.find("div", class_="wsw") or soup.find("article")
 
         if not article_body:
-            return "<p>Не удалось извлечь текст статьи.</p>"
+            return "<p>Не удалось извлечь текст статьи.</p>", temp_files, images_data
 
         for unneeded in article_body.find_all(["script", "style", "iframe", "form"]):
             unneeded.decompose()
 
-        return str(article_body)
+        # Скачиваем изображения и прикрепляем как CID
+        img_tags = article_body.find_all("img")
+        for idx, img in enumerate(img_tags):
+            src = img.get("src") or img.get("data-src")
+            if not src:
+                continue
+
+            img_url = urljoin(BASE_URL, src)
+            try:
+                img_resp = scraper.get(img_url, timeout=15)
+                if img_resp.status_code == 200:
+                    cid_name = f"img_{idx}"
+                    
+                    # Создаем временный файл на диске
+                    ext = os.path.splitext(img_url)[1].split('?')[0] or '.jpg'
+                    tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+                    tmp_file.write(img_resp.content)
+                    tmp_file.close()
+
+                    temp_files.append(tmp_file.name)
+                    images_data.append((tmp_file.name, cid_name, img_resp.content))
+
+                    # Заменяем src на cid: ссылка для письма
+                    img["src"] = f"cid:{cid_name}"
+            except Exception as img_err:
+                print(f"Не удалось скачать картинку {img_url}: {img_err}")
+
+        return str(article_body), temp_files, images_data
+
     except Exception as e:
-        print(f"Ошибка при парсинге статьи {url}: {e}")
-        return "<p>Ошибка при загрузке содержимого статьи.</p>"
+        print(f"Ошибка при обработке статьи {url}: {e}")
+        return "<p>Ошибка при загрузке содержимого статьи.</p>", temp_files, images_data
 
 
-def send_email(subject, html_body, article_url):
-    """Отправляет письмо с тему RF: <Заголовок>."""
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"RF: {subject}"
+def send_email(html_body, article_url, images_data):
+    """
+    Отправляет письмо.
+    Тема письма строго: RF
+    """
+    msg = MIMEMultipart("related")
+    msg["Subject"] = "RF"
     msg["From"] = GMAIL_USER
     msg["To"] = RECIPIENT_EMAIL
 
@@ -111,11 +151,31 @@ def send_email(subject, html_body, article_url):
 
     msg.attach(MIMEText(email_content, "html", "utf-8"))
 
+    # Вкладываем скачанные изображения в письмо
+    for file_path, cid_name, file_bytes in images_data:
+        try:
+            mime_img = MIMEImage(file_bytes)
+            mime_img.add_header("Content-ID", f"<{cid_name}>")
+            mime_img.add_header("Content-Disposition", "inline", filename=os.path.basename(file_path))
+            msg.attach(mime_img)
+        except Exception as e:
+            print(f"Ошибка добавления вложения {file_path}: {e}")
+
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(GMAIL_USER, GMAIL_PASSWORD)
         server.send_message(msg)
 
-    print(f"Отправлено письмо с темой 'RF: {subject}'")
+    print("Отправлено письмо с темой 'RF'")
+
+
+def cleanup_temp_files(files_list):
+    """Удаляет все временные файлы после успешной отправки."""
+    for file_path in files_list:
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except Exception as e:
+                print(f"Не удалось удалить временный файл {file_path}: {e}")
 
 
 def main():
@@ -127,25 +187,28 @@ def main():
         return
 
     new_sent_count = 0
-    # Обрабатываем от старых к новым
     for title, link in reversed(articles):
         if link in sent_articles:
             continue
 
         print(f"Обработка новости: {title} ({link})")
-        content_html = parse_article_content(link)
-        send_email(title, content_html, link)
+        content_html, temp_files, images_data = parse_and_process_article(link)
 
-        sent_articles.add(link)
-        new_sent_count += 1
+        try:
+            send_email(content_html, link, images_data)
+            sent_articles.add(link)
+            new_sent_count += 1
+        finally:
+            # Обязательно удаляем временные картинки/файлы с диска
+            cleanup_temp_files(temp_files)
 
     if new_sent_count > 0:
         save_sent_articles(sent_articles)
-        print(f"Обработано новых статей: {new_sent_count}")
+        print(f"Обработано и отправлено новых статей: {new_sent_count}")
     else:
         print("Новых статей нет.")
 
 
 if __name__ == "__main__":
     main()
-    
+        
