@@ -68,7 +68,7 @@ def parse_article_content(url):
 def send_email(subject, html_body, article_url):
     """Отправляет письмо с HTML-содержимым статьи."""
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"FR: {subject}"
+    msg["Subject"] = f"FR"
     msg["From"] = GMAIL_USER
     msg["To"] = RECIPIENT_EMAIL
 
